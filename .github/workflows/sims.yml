@@ -1,0 +1,276 @@
+# Weekly SimulationCraft gear sims. Public repo (free 4-vCPU runners); the sim code and item data come
+# from private repos: SOURCE_REPO (secret, owner/name) is checked out with SOURCE_READ_TOKEN (secret,
+# fine-grained token with contents: read on that repo and its item data repo).
+#
+# Never triggered by pull requests, so forks cannot reach the secret.
+name: Gear sims
+
+on:
+  schedule:
+    # Wednesdays 06:00 UTC, after the EU weekly reset.
+    - cron: '0 6 * * 3'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: SimC version
+        type: choice
+        options: [latest, nightly]
+        default: latest
+      build:
+        description: Game build
+        type: choice
+        options: [both, live, ptr]
+        default: both
+      specs:
+        description: Spec IDs, comma separated (empty = every DPS and tank spec with a default profile)
+        type: string
+        default: ''
+      fights:
+        description: Fights
+        type: string
+        default: st,aoe3,aoe5
+      sources:
+        description: Loot sources (empty = all)
+        type: string
+        default: ''
+      target_error:
+        description: SimC target_error for every fight (empty = per fight, st 0.2 and aoe3/aoe5 0.5)
+        type: string
+        default: ''
+      app_ref:
+        description: Source branch or commit
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gear-sims
+  cancel-in-progress: false
+
+env:
+  CHANNEL: ${{ inputs.channel || 'latest' }}
+  TARGET_ERROR: ${{ inputs.target_error || '' }}
+  SOURCES: ${{ inputs.sources || '' }}
+
+jobs:
+  setup:
+    if: github.repository_owner == 'Stinth'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      jobs: ${{ steps.matrix.outputs.jobs }}
+      image: ${{ steps.simc.outputs.image }}
+      app_sha: ${{ steps.app.outputs.sha }}
+    steps:
+      - name: Check out sim source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ inputs.app_ref || 'main' }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - id: app
+        run: echo "sha=$(git -C app rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Sync item data
+        working-directory: app
+        env:
+          GITHUB_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node scripts/sync-item-data.mjs
+
+      - name: Get SimC
+        id: simc
+        run: |
+          if [ "$CHANNEL" = nightly ]; then
+            # Build the head of SimC's default branch.
+            git clone --depth 1 https://github.com/simulationcraft/simc.git simc-src
+            docker build -t simc:nightly simc-src
+            image=simc:nightly
+            docker save "$image" | zstd -T0 -3 > simc-image.tar.zst
+          else
+            docker pull simulationcraftorg/simc:latest
+            # Pin the digest so every job runs the same build.
+            image=$(docker inspect --format '{{index .RepoDigests 0}}' simulationcraftorg/simc:latest)
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          id=$(docker create "$image")
+          docker cp "$id:/app/SimulationCraft/profiles" profiles
+          docker rm "$id"
+          docker run --rm "$image" | head -1
+
+      - name: Build job matrix
+        id: matrix
+        working-directory: app
+        env:
+          BUILD: ${{ inputs.build || 'both' }}
+          FIGHTS: ${{ inputs.fights || 'st,aoe3,aoe5' }}
+          SPECS: ${{ inputs.specs || '' }}
+          IMAGE: ${{ steps.simc.outputs.image }}
+        run: |
+          builds=$BUILD
+          [ "$builds" = both ] && builds=live,ptr
+          # Also leaves out specs without a gear-season profile, and PTR jobs whose baseline SimC cannot load yet.
+          matrix=$(node scripts/sims/matrix.mjs --profiles ../profiles --builds "$builds" \
+            --fights "$FIGHTS" --specs "$SPECS" --sources "$SOURCES" --target-error "$TARGET_ERROR" \
+            --simc "docker:$IMAGE" --skipped-out ../matrix-skipped.json 2> ../matrix.log)
+          cat ../matrix.log
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "jobs=$(node -e 'console.log(JSON.parse(process.argv[1]).include.length)' "$matrix")" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Sim jobs"
+            grep -E 'jobs|^skip' ../matrix.log | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inputs
+          retention-days: 3
+          path: |
+            app/src/data
+            profiles
+            matrix-skipped.json
+
+      - if: env.CHANNEL == 'nightly'
+        uses: actions/upload-artifact@v4
+        with:
+          name: simc-image
+          retention-days: 3
+          compression-level: 0
+          path: simc-image.tar.zst
+
+  sim:
+    needs: setup
+    if: needs.setup.outputs.jobs != '0'
+    runs-on: ubuntu-latest
+    # Jobs are sized to stay well under the 6 h limit (scripts/sims/matrix.mjs --max-hours).
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    name: ${{ matrix.build }} ${{ matrix.spec }} ${{ matrix.fight }} ${{ matrix.part }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ needs.setup.outputs.app_sha }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: inputs
+          path: inputs
+
+      - if: env.CHANNEL == 'nightly'
+        uses: actions/download-artifact@v4
+        with:
+          name: simc-image
+
+      - name: Load SimC
+        run: |
+          mkdir -p app/src && mv inputs/app/src/data app/src/data
+          if [ "$CHANNEL" = nightly ]; then zstd -dc simc-image.tar.zst | docker load; else docker pull "${{ needs.setup.outputs.image }}"; fi
+
+      - name: Sim
+        working-directory: app
+        run: |
+          node scripts/sims/run-spec.mjs --spec "${{ matrix.spec }}" --fight "${{ matrix.fight }}" --build "${{ matrix.build }}" \
+            --part "${{ matrix.part }}" --simc "docker:${{ needs.setup.outputs.image }}" \
+            --profiles ../inputs/profiles --threads "$(nproc)" \
+            ${TARGET_ERROR:+--target-error "$TARGET_ERROR"} ${SOURCES:+--sources "$SOURCES"} \
+            --simc-channel "$CHANNEL" --out ../out
+
+      - name: Name the shard
+        id: shard
+        run: echo "name=shard-${{ matrix.build }}-${{ matrix.spec }}-${{ matrix.fight }}-${{ strategy.job-index }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.shard.outputs.name }}
+          retention-days: 7
+          # skipped-*.json: a PTR job whose profile SimC could not load (exits cleanly).
+          path: |
+            out/shard-*.json
+            out/skipped-*.json
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.shard.outputs.name }}-logs
+          retention-days: 7
+          path: out/work/**/*.log
+
+  publish:
+    needs: [setup, sim]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ needs.setup.outputs.app_sha }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: inputs
+          path: inputs
+
+      - name: Merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist shards
+          # Keep files this run did not redo (other build, other specs, skipped PTR) from the previous release.
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'sims-*.json' --dir dist || true
+          node app/scripts/sims/merge.mjs --out dist shards inputs/matrix-skipped.json
+          ls -la dist
+          node -e '
+            const m = JSON.parse(require("fs").readFileSync("dist/manifest.json", "utf8"));
+            const lines = ["### Published", `- ${m.updated.length} files updated, ${m.files.length} in the release`];
+            if (m.skipped.length) lines.push("### Skipped (previous files kept)", ...m.skipped.map((s) => `- ${s.build} ${s.specId}: ${s.reason}`));
+            console.log(lines.join("\n"));
+          ' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="sims-$(date -u +%Y-%m-%d)-${CHANNEL}-${GITHUB_RUN_ID}"
+          gh release create "$tag" dist/*.json --repo "$GITHUB_REPOSITORY" --latest \
+            --title "Gear sims $(date -u +%Y-%m-%d) (SimC ${CHANNEL})" \
+            --notes "Source ${{ needs.setup.outputs.app_sha }}, SimC ${{ needs.setup.outputs.image }}. Sim jobs: ${{ needs.sim.result }}."
